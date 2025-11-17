@@ -1,85 +1,92 @@
-# importer.py (نسخه دائم با اجرای ۲ دقیقه‌ای)
-#
-# این اسکریپت به صورت دائم اجرا می‌شود، هر ۲ دقیقه یکبار
-# به API ها وصل شده و تمام سیگنال‌های جدید را در دیتابیس ذخیره می‌کند.
+# importer.py (نسخه v3.9 - G1=USDT, بقیه=TMN)
 
 import requests
 import mysql.connector
 from mysql.connector import Error
-from config import db_config  # وارد کردن کانفیگ از فایل کناری
-import time                   # <-- کتابخانه زمان برای ایجاد تاخیر اضافه شد
+from config import db_config
+import time
+import json
 
-# لیست آدرس‌های API شما
 API_URLS = [
     "http://103.75.198.172:5005/Internal/arbitrage",
-    "http://api.zerotrade.xyz:8888/g1/signals"
+    "http://103.75.198.172:8888/g1/signals", # <-- G1 API
+    "http://103.75.198.172:8889/computational/signals"
 ]
 
 def get_signal_grade(profit_percentage):
-    """
-    بر اساس درصد سود، گرید سیگنال (Q1 تا Q4) را برمی‌گرداند.
-    """
     try:
-        profit = float(profit_percentage) 
-        
-        if profit >= 7:
-            return 'Q1'
-        elif profit >= 5:
-            return 'Q2'
-        elif profit >= 3:
-            return 'Q3'
-        else:
-            return 'Q4'
+        profit = float(profit_percentage)
+        if profit >= 7: return 'Q1'
+        elif profit >= 5: return 'Q2'
+        elif profit >= 3: return 'Q3'
+        else: return 'Q4'
     except (ValueError, TypeError):
-        return 'N/A' 
+        return 'N/A'
 
 def main():
-    """
-    تابع اصلی برای اتصال به دیتابیس، دریافت API و درج سیگنال‌ها.
-    (این تابع یک چرخه کامل ورود داده را انجام می‌دهد)
-    """
     inserted_count = 0
     cnx = None
     cursor = None
     
     try:
-        # اتصال به دیتابیس با استفاده از اطلاعات فایل کانفیگ
         cnx = mysql.connector.connect(**db_config)
         cursor = cnx.cursor()
         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Successfully connected to 'signal_pool' database.")
 
-        # دستور SQL برای درج داده‌ها
         insert_query = """
             INSERT INTO signal_pool 
-            (pair, coin, signal_grade, strategy_name, exchange, entry_price, target_price) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (pair, coin, signal_grade, profit_percent, strategy_name, exchange, entry_price, target_price) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         for url in API_URLS:
             try:
-                print(f"  Fetching data from: {url}")
+                print(f"\nFetching data from: {url}")
                 response = requests.get(url, timeout=10)
                 response.raise_for_status() 
-                
                 data = response.json()
                 
-                if 'opportunities' in data and data.get('opportunities_found', 0) > 0:
+                # تشخیص اینکه آیا این لینک مربوط به G1 است یا خیر
+                is_g1_api = "8888/g1/signals" in url
+                
+                if 'opportunities' in data and isinstance(data['opportunities'], list) and len(data['opportunities']) > 0:
                     
                     signals_to_insert = []
-                    
                     for signal in data['opportunities']:
-                        pair = signal.get('pair')
+                        
                         coin = signal.get('asset_name')
+                        
+                        # --- منطق پاکسازی نام کوین (از مرحله قبل) ---
+                        if is_g1_api and coin:
+                            if coin.endswith("USDT"):
+                                coin = coin[:-4] 
+                            elif coin.endswith("TMN"):
+                                coin = coin[:-3] 
+                        # -------------------------------------------
+
                         strategy = signal.get('strategy_name')
                         exchange = signal.get('exchange_name')
                         entry_price = signal.get('entry_price')
-                        target_price = signal.get('exit_price')
-                        profit = signal.get('expected_profit_percentage')
 
+                        # --- تغییر اینجاست: منطق PAIR ---
+                        if is_g1_api:
+                            # اگر سیگنال G1 بود -> USDT
+                            pair = 'USDT'
+                        elif strategy == 'Internal' or strategy == 'Computiational':
+                            # اگر بقیه استراتژی‌ها بودند -> TMN
+                            pair = 'TMN'
+                        else:
+                            # حالت پیش‌فرض
+                            pair = signal.get('pair', 'TMN')
+                        # --------------------------------
+
+                        target_price = signal.get('exit_price') or signal.get('take_profit_price')
+                        profit = signal.get('expected_profit_percentage') or signal.get('net_profit_percent')
+                        
                         grade = get_signal_grade(profit)
 
                         insert_data = (
-                            pair, coin, grade, strategy, 
+                            pair, coin, grade, profit, strategy, 
                             exchange, entry_price, target_price
                         )
                         signals_to_insert.append(insert_data)
@@ -87,58 +94,40 @@ def main():
                     if signals_to_insert:
                         cursor.executemany(insert_query, signals_to_insert)
                         cnx.commit() 
-                        
                         count = len(signals_to_insert)
                         inserted_count += count
                         print(f"  [SUCCESS] Inserted {count} signals from this API.")
-                
+
                 else:
-                    print(f"  No opportunities found in this API response.")
+                    print("  [INFO] No opportunities found in this response (List was empty or missing).")
 
             except requests.RequestException as e:
                 print(f"  [ERROR] Error fetching API {url}: {e}")
+            except json.JSONDecodeError:
+                print(f"  [ERROR] Response was not valid JSON. Raw text: {response.text}")
             except Exception as e:
                 print(f"  [ERROR] Error processing data from {url}: {e}")
 
     except Error as e:
         print(f"[DATABASE ERROR] {e}")
-        print("  Please check 'config.py' and MySQL server status.")
     
     finally:
-        # بستن اتصالات در پایان هر چرخه
-        if cursor:
-            cursor.close()
+        if cursor: cursor.close()
         if cnx and cnx.is_connected():
             cnx.close()
             print(f"  Database connection closed for this cycle.")
         
-        print(f"--- Cycle Summary ---")
+        print(f"\n--- Cycle Summary ---")
         print(f"Total Inserted Signals: {inserted_count}")
 
-# ----------------------------------------------------
-# بخش اصلی اجرای دائم
-# ----------------------------------------------------
+
 if __name__ == "__main__":
-    print("--- Service Started ---")
-    print("Running initial import...")
-    
+    print(f"--- Service Started (v3.9 - G1=USDT) ---")
     while True:
         try:
-            # ۱. اجرای تابع اصلی
             main() 
-            
-            # ۲. نمایش پیام انتظار
             print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Cycle complete. Sleeping for 2 minutes (120 seconds)...")
-            
-            # ۳. تاخیر به مدت ۲ دقیقه
             time.sleep(120) 
-        
         except KeyboardInterrupt:
-            # این به شما اجازه می‌دهد با Ctrl+C اسکریپت را متوقف کنید
             print("\nService stopped by user (Ctrl+C). Exiting.")
             break
-        except Exception as e:
-            # در صورت بروز خطای پیش‌بینی نشده در حلقه اصلی
-            print(f"[FATAL ERROR] An unexpected error occurred: {e}")
-            print("Restarting loop after 2 minutes...")
-            time.sleep(120)
